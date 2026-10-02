@@ -93,6 +93,10 @@ async def download_url(
     async with DouyinAPIClient(
         cookie_manager.get_cookies(),
         proxy=config.get("proxy"),
+        browser_include_login_cookies=bool(
+            (config.get("browser_fallback") or {}).get("inject_login_cookies", False)
+        ),
+        browser_fallback_options=config.get("browser_fallback") or {},
     ) as api_client:
         if progress_reporter:
             progress_reporter.advance_step("解析链接", "检查短链并解析 URL")

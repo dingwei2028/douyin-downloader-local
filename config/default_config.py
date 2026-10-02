@@ -96,6 +96,9 @@ DEFAULT_CONFIG: Dict[str, Any] = {
         "max_scrolls": 240,
         "idle_rounds": 8,
         "wait_timeout_seconds": 600,
+        # CLI: True 时把 sessionid 等登录 Cookie 注入兜底浏览器，
+        # 否则浏览器是匿名态，抖音只给置顶几条 + 登录墙（2026-10-02）。
+        "inject_login_cookies": False,
     },
     # 下载完成通知（可选）。providers 支持 bark / telegram / webhook。
     "notifications": {

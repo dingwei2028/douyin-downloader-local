@@ -1,0 +1,6 @@
+# cmd.exe 解析 LF-only 的 .bat/.cmd 会出错（尤其 if/for 块与多行续行）。
+# 用 -text 关掉一切换行转换：字节原样入库，任何克隆方式拿到的都是 CRLF。
+*.bat -text
+*.cmd -text
+
+# 其余文本交给 core.autocrlf / 编辑器自行处理，不在这里强制。

@@ -1264,6 +1264,11 @@ class BaseDownloader(ABC):
     # /aweme/v1/play/ 的 ratio=default 会 302 到上传原片。web detail API 的
     # bit_rate 阶梯不含该档(实测最高档可比原画小 8 倍),原画只能走这里。
     _ORIGINAL_PROBE_TIMEOUT_SECONDS = 10
+    # 探测失败会**静默**回退到转码档,用户只在播放时才发现"怎么这么糊"。
+    # play 端点 302 的落点按请求抽签 CDN/PCDN 节点,偶发落到慢节点就单次
+    # 超时(实测 24 次里出现过 2 次),所以单次赌不得:重试 3 次、退避递增。
+    _ORIGINAL_PROBE_ATTEMPTS = 3
+    _ORIGINAL_PROBE_BACKOFF_SECONDS = 0.8
 
     async def _maybe_promote_original_candidate(
         self,
@@ -1317,6 +1322,10 @@ class BaseDownloader(ABC):
 
         content-type 必须是 video/*:WAF 拦截页等 200+HTML 响应不得被
         误判为原画。任何异常都返回 None,由调用方退回原候选链。
+
+        失败会重试 ``_ORIGINAL_PROBE_ATTEMPTS`` 次(退避递增):play 端点 302
+        的落点按请求抽签,偶发落到慢节点会让单次探测超时,而"探测失败"的
+        后果是静默回退到低码率转码档——不值得赌一次。
         """
         params = {
             "video_id": uri,
@@ -1332,39 +1341,53 @@ class BaseDownloader(ABC):
             params["ss_is_p_v_ss"] = "1"
         signed_url, ua = self.api_client.build_signed_path("/aweme/v1/play/", params)
         headers = {**self._download_headers(user_agent=ua), "Range": "bytes=0-0"}
-        try:
-            async with session.get(
-                signed_url,
-                headers=headers,
-                allow_redirects=True,
-                proxy=getattr(self.api_client, "proxy", None) or None,
-                timeout=aiohttp.ClientTimeout(total=self._ORIGINAL_PROBE_TIMEOUT_SECONDS),
-            ) as resp:
-                if resp.status not in (200, 206):
-                    raise ValueError(f"unexpected status {resp.status}")
-                if not str(resp.content_type or "").startswith("video/"):
-                    raise ValueError(f"unexpected content-type {resp.content_type}")
-                content_range = str(resp.headers.get("Content-Range") or "")
-                raw_total = (
-                    content_range.rsplit("/", 1)[-1]
-                    if "/" in content_range
-                    else resp.headers.get("Content-Length")
-                )
-                total = int(raw_total or 0)
-                if total <= 0:
-                    raise ValueError(f"missing total size (Content-Range={content_range!r})")
-                return str(resp.url), total
-        except Exception as error:
-            # 探测是 best-effort:任何失败(网络、WAF 403 限速、签名、假
-            # session)都必须退回原候选链,绝不能让主下载流程因此中断。但要
-            # 留下可见线索:play 端点被限速时批量任务会整批降级到可小数倍
-            # 的转码档,只有 debug 日志用户根本无从察觉。复用限量日志防刷屏。
-            self._log_download_error(
-                logger.warning,
-                f"Original-quality probe failed for {uri}: {error}; "
-                "falling back to transcoded tracks",
-            )
-            return None
+        attempts = max(1, int(self._ORIGINAL_PROBE_ATTEMPTS))
+        last_error: Optional[BaseException] = None
+        for attempt in range(1, attempts + 1):
+            try:
+                async with session.get(
+                    signed_url,
+                    headers=headers,
+                    allow_redirects=True,
+                    proxy=getattr(self.api_client, "proxy", None) or None,
+                    timeout=aiohttp.ClientTimeout(total=self._ORIGINAL_PROBE_TIMEOUT_SECONDS),
+                ) as resp:
+                    if resp.status not in (200, 206):
+                        raise ValueError(f"unexpected status {resp.status}")
+                    if not str(resp.content_type or "").startswith("video/"):
+                        raise ValueError(f"unexpected content-type {resp.content_type}")
+                    content_range = str(resp.headers.get("Content-Range") or "")
+                    raw_total = (
+                        content_range.rsplit("/", 1)[-1]
+                        if "/" in content_range
+                        else resp.headers.get("Content-Length")
+                    )
+                    total = int(raw_total or 0)
+                    if total <= 0:
+                        raise ValueError(f"missing total size (Content-Range={content_range!r})")
+                    if attempt > 1:
+                        logger.info(
+                            "Original-quality probe succeeded on attempt %s/%s for %s",
+                            attempt,
+                            attempts,
+                            uri,
+                        )
+                    return str(resp.url), total
+            except Exception as error:
+                last_error = error
+                if attempt < attempts:
+                    await asyncio.sleep(self._ORIGINAL_PROBE_BACKOFF_SECONDS * attempt)
+        # 探测是 best-effort:任何失败(网络、WAF 403 限速、签名、假
+        # session)都必须退回原候选链,绝不能让主下载流程因此中断。但要
+        # 留下可见线索:play 端点被限速时批量任务会整批降级到可小数倍
+        # 的转码档,只有 debug 日志用户根本无从察觉。复用限量日志防刷屏。
+        self._log_download_error(
+            logger.warning,
+            f"Original-quality probe failed after {attempts} attempts for {uri}: "
+            f"{last_error!r}; falling back to transcoded tracks (lower bitrate). "
+            "Run with -v/--show-warnings to see this line.",
+        )
+        return None
 
     # 视频画质选择支持的规格名称。值保留为横屏长边尺寸，用于兼容只有
     # width 的旧响应；完整 width/height 响应会按短边匹配 1080p/720p 等档位。

@@ -281,6 +281,11 @@ def test_browser_fallback_caps_warmup_wait(monkeypatch):
 
     client = DouyinAPIClient({"msToken": "token-1"})
 
+    # 这个假页面永远不会发页内作品请求,水合等待会一直空转到上限。
+    # 置 0 让等待立即超时 —— 本用例验的是"超时后照旧进入 warmup/滚动"
+    # 而不是"等满整段预算"。
+    monkeypatch.setattr(client, "_BROWSER_HYDRATION_WAIT_MAX_SECONDS", 0)
+
     async def _fake_extract(_page):
         return []
 

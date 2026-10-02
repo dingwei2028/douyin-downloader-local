@@ -365,15 +365,29 @@ class DouyinAPIClient:
         "passport_mfa_token",
         "login_time",
     }
+    # 等「页内作品接口首次返回」(即 SPA 水合完成)的上限,与
+    # ``wait_timeout_seconds`` 分开:后者是「人工过验证码 / 登录」的总预算
+    # (默认 600s),拿它当水合预算会让无人值守场景白等 10 分钟。真实水合
+    # 只需几秒;超时后照旧进入滚动阶段,滚动里还有一轮挑战检测兜底。
+    _BROWSER_HYDRATION_WAIT_MAX_SECONDS = 90
 
     def __init__(
         self,
         cookies: Dict[str, str],
         proxy: Optional[str] = None,
         page_bridge: Optional[Any] = None,
+        browser_include_login_cookies: bool = False,
+        browser_fallback_options: Optional[Dict[str, Any]] = None,
     ):
         self.cookies = sanitize_cookies(cookies or {})
         self.proxy = str(proxy or "").strip()
+        # CLI 专用：True 时浏览器兜底把 sessionid 等登录 Cookie 一并注入。
+        # 不注入 = 匿名浏览 = 抖音只给置顶几条 + 登录墙，滚不出后续分页
+        # （2026-10-02 实测）。桌面版有独立登录窗口，默认 False 保持原行为。
+        self._browser_include_login_cookies = bool(browser_include_login_cookies)
+        # browser_fallback 配置段（enabled / headless / wait_timeout_seconds）。
+        # 单条视频详情兜底要用它，而这条路径不经过 UserDownloader。
+        self._browser_fallback_options = dict(browser_fallback_options or {})
         # 桌面版注入的页面签名通道(core/page_bridge.py,desktop-only)。为 None 时
         # 所有端点走 aiohttp——CLI 姊妹仓永远是 None。鸭子类型:只要求
         # ``await fetch(path, params, method=, data=)`` 返回带 http_status/body/text
@@ -942,7 +956,129 @@ class DouyinAPIClient:
             # aweme_detail is null without a filter reason — no retry needed
             break
 
-        return None
+        # 抖音对非页面发起的 aweme/detail 一律 403（ArgusSecurityPlugin），
+        # 三个 aid 都会栽在同一个门禁上。让请求从真浏览器页面里发出。
+        detail = await self._fetch_video_detail_via_browser(aweme_id)
+        if detail:
+            logger.warning(
+                "aweme/detail 被门禁拒绝，已用浏览器兜底取到详情: aweme_id=%s", aweme_id
+            )
+        return detail
+
+    async def _fetch_video_detail_via_browser(self, aweme_id: str) -> Optional[Dict[str, Any]]:
+        """用真浏览器打开视频页，抓页内 /aweme/web/aweme/detail/ 的响应体。
+
+        2026-10-02 实测：同一接口在页内发起是 200 + 完整 aweme_detail
+        （含 play_addr / bit_rate），纯 HTTP 发起是 403
+        ``Blocked by ArgusSecurityPlugin Uifid Not Found``。
+        """
+        options = self._browser_fallback_options or {}
+        # 缺省 **关闭**:只有显式传入 enabled=True 才拉起浏览器。真实运行走
+        # ConfigLoader(默认段里 enabled=True)所以照常开启;而裸构造的客户端
+        # (单元测试、被当库调用)不会突然去联网开一个真浏览器——2026-10-02
+        # 实测这会让一个纯 mock 用例意外启动 Chromium 并空转 237s。
+        if not options.get("enabled", False):
+            logger.warning("浏览器兜底未启用（browser_fallback.enabled 非 true），跳过单作品详情兜底")
+            return None
+        try:
+            from playwright.async_api import async_playwright
+        except Exception as exc:
+            logger.warning("Playwright 不可用，单作品详情兜底跳过: %s", exc)
+            return None
+
+        target_url = f"{self.BASE_URL}/video/{aweme_id}"
+        headless = bool(options.get("headless", False))
+        # 单条视频页要么十几秒内就把详情请求发出来，要么就是没有；不等满
+        # 用户给批量场景配的 600s，避免一条不存在/被删的作品把任务挂死。
+        budget_seconds = min(90, max(30, int(options.get("wait_timeout_seconds", 90) or 90)))
+        timeout_ms = max(30, int(options.get("wait_timeout_seconds", 120) or 120)) * 1000
+        holder: Dict[str, Any] = {}
+
+        async def _handle_response(response) -> None:
+            url = response.url or ""
+            if "/aweme/v1/web/aweme/detail/" not in url:
+                return
+            try:
+                data = await response.json()
+            except Exception:
+                return
+            detail = data.get("aweme_detail") if isinstance(data, dict) else None
+            if isinstance(detail, dict) and detail.get("aweme_id") and not holder.get("detail"):
+                holder["detail"] = detail
+
+        logger.warning(
+            "单作品详情走浏览器兜底: aweme_id=%s headless=%s budget_s=%s",
+            aweme_id,
+            headless,
+            budget_seconds,
+        )
+
+        async with async_playwright() as playwright:
+            browser = await playwright.chromium.launch(
+                headless=headless,
+                args=[
+                    "--disable-blink-features=AutomationControlled",
+                    "--disable-dev-shm-usage",
+                    "--no-sandbox",
+                ],
+            )
+            context = await browser.new_context(
+                locale="zh-CN", viewport={"width": 1600, "height": 900}
+            )
+            cookies = self._browser_cookie_payload()
+            if cookies:
+                await context.add_cookies(cookies)
+            page = await context.new_page()
+            pending: List[asyncio.Task] = []
+
+            def _on_response(response) -> None:
+                pending.append(asyncio.create_task(_handle_response(response)))
+
+            page.on("response", _on_response)
+
+            async def _wait_detail() -> None:
+                loop = asyncio.get_running_loop()
+                deadline = loop.time() + budget_seconds
+                while not holder.get("detail") and loop.time() < deadline:
+                    if page.is_closed():
+                        logger.warning("视频页在等待详情时被关闭")
+                        return
+                    challenge = await self._detect_page_challenge(page)
+                    if challenge:
+                        logger.warning(
+                            "检测到抖音安全验证（%s），请在浏览器窗口中完成，程序会自动继续",
+                            challenge,
+                        )
+                        await self._wait_for_page_challenge(
+                            page, wait_timeout_seconds=budget_seconds
+                        )
+                        try:
+                            await page.reload(wait_until="domcontentloaded", timeout=timeout_ms)
+                        except Exception as exc:
+                            logger.warning("验证后重载视频页失败: %s", exc)
+                        continue
+                    await page.wait_for_timeout(1000)
+
+            try:
+                try:
+                    await page.goto(target_url, wait_until="domcontentloaded", timeout=timeout_ms)
+                except Exception as exc:
+                    logger.warning("视频页打开超时或出错，按当前状态继续: %s", exc)
+                await _wait_detail()
+            finally:
+                if pending:
+                    await asyncio.gather(*pending, return_exceptions=True)
+                try:
+                    self._sync_browser_cookies(await context.cookies(self.BASE_URL))
+                except Exception as exc:
+                    logger.debug("视频页 cookie 回同步跳过: %s", exc)
+                await context.close()
+                await browser.close()
+
+        detail = holder.get("detail")
+        if not detail:
+            logger.warning("浏览器兜底未取到作品详情: aweme_id=%s", aweme_id)
+        return detail
 
     async def get_user_post(
         self, sec_uid: str, max_cursor: int = 0, count: int = 18
@@ -1878,6 +2014,10 @@ class DouyinAPIClient:
         post_api_seen: set[str] = set()
         post_api_aweme_items: Dict[str, Dict[str, Any]] = {}
         post_api_page_hits = 0
+        # 页内 /aweme/post/ 首次响应的信号。抖音 SPA 水合完成前不会发这个
+        # 请求；水合前就滚动会让它一直不来（2026-10-02 实测：goto 后立刻
+        # 滚，40~60s 内页内接口 0 次命中，只剩 SSR 壳里的几个 id）。
+        post_xhr_seen = asyncio.Event()
         self._browser_post_aweme_items = {}
         self._browser_post_stats = {}
 
@@ -1914,7 +2054,9 @@ class DouyinAPIClient:
                 ],
             )
             context = await browser.new_context(
-                user_agent=self.headers.get("User-Agent", ""),
+                # 不再强塞 API 客户端的 UA：声称 Chrome/139 而实际是
+                # Chromium 153 的不一致是指纹破绽，会触发滑块验证并卡住
+                # 分页（2026-10-02 实测）。让浏览器用自己的真实 UA。
                 locale="zh-CN",
                 viewport={"width": 1600, "height": 900},
             )
@@ -1939,6 +2081,7 @@ class DouyinAPIClient:
                     data = await response.json()
                 except Exception:
                     return
+                post_xhr_seen.set()
                 aweme_items = data.get("aweme_list") if isinstance(data, dict) else None
                 if isinstance(aweme_items, list):
                     post_api_page_hits += 1
@@ -2004,6 +2147,32 @@ class DouyinAPIClient:
                         except Exception as exc:
                             logger.warning("Reload user page after verification failed: %s", exc)
 
+                # 关键时序：先等页内作品接口落地，再进入滚动阶段。等待期
+                # 同时给登录墙 / 滑块验证留出人工处理时间（headful 窗口里
+                # 完成一下即可，程序会自动继续）。
+                if not post_xhr_seen.is_set():
+                    hydration_budget = max(
+                        0,
+                        min(
+                            int(wait_timeout_seconds),
+                            int(self._BROWSER_HYDRATION_WAIT_MAX_SECONDS),
+                        ),
+                    )
+                    logger.warning(
+                        "等待页内作品接口首次返回（最多 %ss）；"
+                        "如窗口弹出登录 / 验证，请手动完成后程序会自动继续",
+                        hydration_budget,
+                    )
+                    try:
+                        await asyncio.wait_for(
+                            post_xhr_seen.wait(), timeout=hydration_budget
+                        )
+                    except asyncio.TimeoutError:
+                        logger.warning(
+                            "页内作品接口 %ss 内未返回，继续按当前页面状态采集",
+                            hydration_budget,
+                        )
+
                 try:
                     warmup_seconds = min(20, max(3, int(wait_timeout_seconds)))
                     for _ in range(warmup_seconds):
@@ -2023,11 +2192,21 @@ class DouyinAPIClient:
                         if page.is_closed():
                             logger.warning("Browser page closed during scrolling")
                             break
+                        before = len(ids)
+                        pages_before = post_api_page_hits
+                        # 鼠标默认停在 (0,0) = 左侧固定导航栏，wheel 事件会被
+                        # 导航吃掉、主 feed 不滚、无限加载永不触发（2026-10-02
+                        # 实测分页卡在第 2 页）。挪到视口中央再滚。
+                        await page.mouse.move(800, 500)
                         await page.mouse.wheel(0, 3800)
                         await page.wait_for_timeout(1200)
 
-                        before = len(ids)
                         _merge(await self._extract_aweme_ids_from_page(page))
+                        # 页内接口的翻页响应常比渲染慢半拍：只要还有新页
+                        # 回来就算活跃，别按「id 没涨」提前收工。
+                        if post_api_page_hits > pages_before:
+                            stable_rounds = 0
+                            continue
                         if len(ids) == before:
                             stable_rounds += 1
                         else:
@@ -2035,6 +2214,22 @@ class DouyinAPIClient:
 
                         if expected_count > 0 and len(ids) >= expected_count:
                             break
+
+                        # 抖音会在连续翻几页后弹点选文字 / 滑块验证掐自动化。
+                        # 立刻收工等于白跑：停下来等人在 headful 窗口里点掉，
+                        # 点完继续（headless 下等不到，按预算超时收场）。
+                        challenge = await self._detect_page_challenge(page)
+                        if challenge:
+                            logger.warning(
+                                "检测到抖音安全验证（%s），请在浏览器窗口中完成，"
+                                "程序会自动继续",
+                                challenge,
+                            )
+                            await self._wait_for_page_challenge(
+                                page, wait_timeout_seconds=wait_timeout_seconds
+                            )
+                            stable_rounds = 0
+
                         if expected_count <= 0 and stable_rounds >= idle_stop_rounds:
                             break
                 except Exception as exc:
@@ -2094,7 +2289,7 @@ class DouyinAPIClient:
         for name, value in self.cookies.items():
             if not name:
                 continue
-            if name in self._BROWSER_COOKIE_BLOCKLIST:
+            if name in self._BROWSER_COOKIE_BLOCKLIST and not self._browser_include_login_cookies:
                 continue
             payload.append(
                 {
@@ -2104,6 +2299,40 @@ class DouyinAPIClient:
                 }
             )
         return payload
+
+    _PAGE_CHALLENGE_JS = """
+() => {
+  const keys = ['依次点击文字', '请完成下列验证', '拖动下方滑块', '完成安全验证', '安全验证'];
+  const nodes = document.querySelectorAll('div,span,p');
+  for (let i = 0; i < nodes.length && i < 5000; i++) {
+    const el = nodes[i];
+    if (el.children.length > 2) continue;
+    const t = (el.textContent || '').trim();
+    if (t && t.length <= 40 && keys.some((k) => t.includes(k))) return t;
+  }
+  return null;
+}
+"""
+
+    async def _detect_page_challenge(self, page) -> Optional[str]:
+        """页面上有安全验证弹层（点选文字 / 滑块 / 完成验证）时返回提示文本。"""
+        try:
+            text = await page.evaluate(self._PAGE_CHALLENGE_JS)
+        except Exception:
+            return None
+        return str(text).strip() or None if text else None
+
+    async def _wait_for_page_challenge(self, page, *, wait_timeout_seconds: int) -> None:
+        """等人把验证点完；弹层消失即返回，超时按当前状态继续。"""
+        deadline = asyncio.get_running_loop().time() + min(300, max(30, wait_timeout_seconds))
+        while asyncio.get_running_loop().time() < deadline:
+            if page.is_closed():
+                return
+            if not await self._detect_page_challenge(page):
+                logger.warning("安全验证已通过，继续采集")
+                return
+            await page.wait_for_timeout(2000)
+        logger.warning("等待安全验证超时，按当前页面状态继续采集")
 
     async def _extract_aweme_ids_from_page(self, page) -> List[str]:
         script = """

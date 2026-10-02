@@ -321,5 +321,99 @@ class TestOriginalPromotion:
         assert session.calls == []
 
 
+class _ScriptedSession:
+    """按脚本依次作答:元素是 Exception 就抛,否则当响应返回;用完就重复最后一项。
+
+    用来验证"重试":单次超时/坏响应不得直接让画质降级。
+    """
+
+    def __init__(self, script):
+        self.script = list(script)
+        self.calls = []
+
+    def get(self, url, **kwargs):
+        self.calls.append((url, kwargs))
+        item = self.script[min(len(self.calls) - 1, len(self.script) - 1)]
+        if isinstance(item, Exception):
+            raise item
+        return item
+
+
+class TestOriginalProbeRetry:
+    """探测失败会静默回退到低码率转码档,所以单次抖动必须重试。"""
+
+    def _prepare(self, downloader, session):
+        downloader.api_client = Mock(wraps=downloader.api_client)
+        downloader.api_client.build_signed_path = Mock(
+            return_value=("https://www.douyin.com/aweme/v1/play/?signed=1", "UA-Probe")
+        )
+        downloader.api_client.headers = {"User-Agent": "UA-Default"}
+        downloader.api_client.BASE_URL = "https://www.douyin.com"
+        # 测试里不需要真的等退避
+        downloader._ORIGINAL_PROBE_BACKOFF_SECONDS = 0
+        return session
+
+    def test_retries_then_promotes(self, tmp_path):
+        downloader = _build_video_downloader(tmp_path)
+        aweme = _aweme(gear_size=8_000_000)
+        base = downloader._build_video_url_candidates(aweme)
+        session = self._prepare(
+            downloader,
+            _ScriptedSession([OSError("connect timeout"), _FakeResponse(total_size=70_000_000)]),
+        )
+
+        result = asyncio.run(
+            downloader._maybe_promote_original_candidate(aweme, list(base), session)
+        )
+
+        assert len(session.calls) == 2
+        assert result[0][0] == "https://v99-coldx.douyinvod.com/original/video.mp4"
+
+    def test_bad_response_is_also_retried(self, tmp_path):
+        """403 / HTML 拦截页这类"响应不对"与网络异常同等对待,都要重试。"""
+        downloader = _build_video_downloader(tmp_path)
+        aweme = _aweme(gear_size=8_000_000)
+        base = downloader._build_video_url_candidates(aweme)
+        session = self._prepare(
+            downloader,
+            _ScriptedSession([_FakeResponse(status=403), _FakeResponse(total_size=70_000_000)]),
+        )
+
+        result = asyncio.run(
+            downloader._maybe_promote_original_candidate(aweme, list(base), session)
+        )
+
+        assert len(session.calls) == 2
+        assert result[0][0] == "https://v99-coldx.douyinvod.com/original/video.mp4"
+
+    def test_gives_up_after_configured_attempts(self, tmp_path):
+        downloader = _build_video_downloader(tmp_path)
+        aweme = _aweme()
+        base = downloader._build_video_url_candidates(aweme)
+        session = self._prepare(downloader, _ScriptedSession([OSError("boom")]))
+
+        result = asyncio.run(
+            downloader._maybe_promote_original_candidate(aweme, list(base), session)
+        )
+
+        assert result == base
+        assert len(session.calls) == downloader._ORIGINAL_PROBE_ATTEMPTS
+
+    def test_single_attempt_is_allowed(self, tmp_path):
+        """把尝试次数设成 1 时应退化为旧行为(不重试)。"""
+        downloader = _build_video_downloader(tmp_path)
+        downloader._ORIGINAL_PROBE_ATTEMPTS = 1
+        aweme = _aweme()
+        base = downloader._build_video_url_candidates(aweme)
+        session = self._prepare(downloader, _ScriptedSession([OSError("boom")]))
+
+        result = asyncio.run(
+            downloader._maybe_promote_original_candidate(aweme, list(base), session)
+        )
+
+        assert result == base
+        assert len(session.calls) == 1
+
+
 if __name__ == "__main__":
     pytest.main([__file__, "-v"])

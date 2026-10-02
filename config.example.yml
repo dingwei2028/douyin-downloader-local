@@ -73,9 +73,11 @@ database_path: dy_downloader.db
 
 # 视频下载画质。抖音 API 为每个视频返回多档码率，此选项决定选用哪一档：
 #   original                 - 原画：探测上传原片（转码档列表之外，可比最高
-#                              转码档大数倍），比转码档大则优先下载原片，探测
-#                              失败时退回最高转码档。代价是每条作品多一次探测
-#                              请求（超时 10s）
+#                              转码档大数倍；实测一条阶梯最高 960x720/1.15Mbps
+#                              的视频，原片是 1440x1080 HEVC 60fps/14.6Mbps），
+#                              比转码档大则优先下载原片，探测失败时退回最高
+#                              转码档。代价是每条作品多一次探测请求（超时 10s，
+#                              最多重试 3 次）
 #   highest                  - 最高转码档（默认）：只在 bit_rate 阶梯里挑，
 #                              不发探测请求
 #   lowest                   - 最低可用档（省流量）
@@ -104,6 +106,9 @@ browser_fallback:
   max_scrolls: 240
   idle_rounds: 8
   wait_timeout_seconds: 600
+  # CLI: true = 把 sessionid 等登录 Cookie 注入兜底浏览器。
+  # 不注入时浏览器是匿名态，作者主页只给置顶几条 + 登录墙（2026-10 实测）。
+  inject_login_cookies: true
 
 # 评论采集（可选）：启用后每个作品会额外生成 *_comments.json
 comments:

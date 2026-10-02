@@ -45,6 +45,13 @@ config*.yml
 config/cookies.json
 .omx/
 
+# 运行时派生配置：dy_run.py / dy_one.py 生成的 config.yml 副本，
+# 内含 cookies（sessionid / odin_tt / sid_guard）明文 —— 绝不能提交
+_cfg_dy_*.yml
+
+# 本地链接清单（finddyUP.bat 的输入，运行期草稿）
+dy_urls.txt
+
 # Editor / IDE local settings
 .claude/
 .idea/

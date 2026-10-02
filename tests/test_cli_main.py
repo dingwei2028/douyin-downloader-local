@@ -12,7 +12,7 @@ class _FakeCookieManager:
 
 
 class _FakeAPIClient:
-    def __init__(self, _cookies, proxy=None):
+    def __init__(self, _cookies, proxy=None, **kwargs):
         self.proxy = proxy
         self.resolved_urls = []
 
@@ -74,7 +74,7 @@ async def test_download_url_passes_proxy_to_api_client(monkeypatch, tmp_path):
     captured = {}
 
     class _ProxyAPIClient(_FakeAPIClient):
-        def __init__(self, cookies, proxy=None):
+        def __init__(self, cookies, proxy=None, **kwargs):
             captured["cookies"] = cookies
             captured["proxy"] = proxy
             super().__init__(cookies, proxy=proxy)
@@ -117,7 +117,7 @@ async def test_discovery_subcommand_passes_proxy_to_api_client(monkeypatch, tmp_
     captured = {}
 
     class _ProxyAPIClient(_FakeAPIClient):
-        def __init__(self, cookies, proxy=None):
+        def __init__(self, cookies, proxy=None, **kwargs):
             captured["proxy"] = proxy
             super().__init__(cookies, proxy=proxy)
 
